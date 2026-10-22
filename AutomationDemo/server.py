@@ -40,6 +40,7 @@ h1{font-size:24px;margin:0 0 6px}
 label{display:block;margin:14px 0 6px;font-size:14px;color:#c6d2e0}
 input,select,textarea{width:100%;box-sizing:border-box;padding:10px 12px;border-radius:8px;
       border:1px solid #2a466b;background:#0b1220;color:#f0f4f8;font-size:15px}
+textarea{resize:vertical;max-width:100%}
 button{margin-top:20px;width:100%;padding:12px;border:0;border-radius:8px;cursor:pointer;
        background:#2aabee;color:#fff;font-size:16px;font-weight:600}
 .err{color:#ff7b72;margin-top:12px}
@@ -185,11 +186,12 @@ async def export_csv(request: web.Request) -> web.Response:
     ) as cursor:
         rows = await cursor.fetchall()
     buf = io.StringIO()
-    writer = csv.writer(buf)
+    # Разделитель ";" и BOM: русский Excel открывает файл по колонкам и без кракозябр
+    writer = csv.writer(buf, delimiter=";")
     writer.writerow(["id", "name", "phone", "service", "comment", "created_at"])
     writer.writerows(rows)
     return web.Response(
-        text=buf.getvalue(),
+        text="\ufeff" + buf.getvalue(),
         content_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=leads.csv"},
     )

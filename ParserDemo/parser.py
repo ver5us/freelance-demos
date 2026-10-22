@@ -65,7 +65,10 @@ async def main(pages: int) -> None:
             print(f"Страница {page}: собрано книг — {len(books)}")
 
     with open(OUT_CSV, "w", newline="", encoding="utf-8-sig") as fh:
-        writer = csv.DictWriter(fh, fieldnames=["title", "price", "availability", "rating"])
+        # Разделитель ";": русский Excel раскладывает данные по колонкам
+        writer = csv.DictWriter(
+            fh, fieldnames=["title", "price", "availability", "rating"], delimiter=";"
+        )
         writer.writeheader()
         writer.writerows(all_books)
 
