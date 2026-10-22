@@ -1,0 +1,15 @@
+# Виртуальные окружения
+venv/
+.venv/
+
+# Секреты
+.env
+
+# Локальные базы и артефакты запуска
+*.db
+AutomationDemo/leads.db
+ParserDemo/books.csv
+
+# Служебное
+__pycache__/
+*.pyc
