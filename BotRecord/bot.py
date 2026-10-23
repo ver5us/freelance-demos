@@ -5,6 +5,12 @@ BotRecord — Telegram-бот записи для малого бизнеса.
 Демо-проект для портфолио: салон / клиника / барбершоп / фитнес / автосервис.
 Стек: aiogram 3.x + aiosqlite (SQLite) + python-dotenv.
 
+Особенности версии:
+— слот занят под конкретную услугу: на одно время могут записаться разные услуги;
+— отмена любой своей записи, а не только последней;
+— кнопки «назад» на каждом шаге сценария;
+— телефон: от 10 до 11 цифр, не больше.
+
 Запуск: python bot.py
 """
 
@@ -95,34 +101,55 @@ CREATE TABLE IF NOT EXISTS bookings (
     time TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',
     created_at TEXT NOT NULL
-);
+)
+"""
+
+# Слот занят в разрезе «услуга + дата + время» среди активных записей:
+# разные услуги могут идти параллельно, одна услуга — нет.
+CREATE_INDEX_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS ux_bookings_active
+    ON bookings(service_id, date, time) WHERE status = 'active'
 """
 
 
 async def init_db() -> None:
-    """Создаёт таблицу записей, если её ещё нет."""
+    """Создаёт таблицу и индекс; старую схему демо-базы пересоздаёт."""
     async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='bookings'"
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is not None:
+            async with db.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='bookings'"
+            ) as cursor:
+                indexes = {r[0] for r in await cursor.fetchall()}
+            if "ux_bookings_active" not in indexes:
+                await db.execute("DROP TABLE bookings")  # демо-данные старой схемы
         await db.execute(CREATE_TABLE_SQL)
+        await db.execute(CREATE_INDEX_SQL)
         await db.commit()
 
 
-async def get_booked_times(date_iso: str) -> set:
-    """Возвращает множество занятых слотов времени на указанную дату."""
+async def get_booked_times(date_iso: str, service_id: int) -> set:
+    """Занятые слоты на дату для конкретной услуги."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT time FROM bookings WHERE date = ? AND status = 'active'",
-            (date_iso,),
+            "SELECT time FROM bookings "
+            "WHERE date = ? AND service_id = ? AND status = 'active'",
+            (date_iso, service_id),
         ) as cursor:
             rows = await cursor.fetchall()
     return {row[0] for row in rows}
 
 
-async def is_slot_taken(date_iso: str, time_str: str) -> bool:
-    """Проверяет, занят ли слот (дата + время) активной записью."""
+async def is_slot_taken(date_iso: str, time_str: str, service_id: int) -> bool:
+    """Проверяет, занят ли слот под данную услугу."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT 1 FROM bookings WHERE date = ? AND time = ? AND status = 'active'",
-            (date_iso, time_str),
+            "SELECT 1 FROM bookings "
+            "WHERE date = ? AND time = ? AND service_id = ? AND status = 'active'",
+            (date_iso, time_str, service_id),
         ) as cursor:
             return await cursor.fetchone() is not None
 
@@ -175,32 +202,26 @@ async def get_user_active_bookings(telegram_user_id: int) -> list:
             return await cursor.fetchall()
 
 
-async def cancel_last_active_booking(telegram_user_id: int):
-    """Отменяет последнюю активную запись пользователя.
-
-    Возвращает словарь с данными отменённой записи или None,
-    если активных записей нет.
-    """
+async def get_booking_by_id(booking_id: int):
+    """Запись по id (для отмены конкретной записи)."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            """
-            SELECT * FROM bookings
-            WHERE telegram_user_id = ? AND status = 'active'
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (telegram_user_id,),
+            "SELECT * FROM bookings WHERE id = ?", (booking_id,)
         ) as cursor:
             row = await cursor.fetchone()
-        if row is None:
-            return None
-        await db.execute(
-            "UPDATE bookings SET status = 'cancelled' WHERE id = ?",
-            (row["id"],),
+        return dict(row) if row else None
+
+
+async def cancel_booking(booking_id: int) -> bool:
+    """Переводит запись в статус cancelled. False, если её нет или она не активна."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE bookings SET status = 'cancelled' WHERE id = ? AND status = 'active'",
+            (booking_id,),
         )
         await db.commit()
-        return dict(row)
+        return cursor.rowcount > 0
 
 
 async def get_bookings_for_date(date_iso: str) -> list:
@@ -211,7 +232,7 @@ async def get_bookings_for_date(date_iso: str) -> list:
             """
             SELECT * FROM bookings
             WHERE date = ? AND status = 'active'
-            ORDER BY time
+            ORDER BY time, service_id
             """,
             (date_iso,),
         ) as cursor:
@@ -270,17 +291,22 @@ def validate_name(text: str):
 
 
 def validate_phone(text: str):
-    """Проверяет телефон. Возвращает телефон как введён или None.
+    """Проверяет телефон: от 10 до 11 цифр. Возвращает телефон как введён или None.
 
     Допустимы форматы: +7 999 123-45-67, 89991234567, 9991234567.
-    Правило одно: не меньше 10 цифр.
     """
     if text.strip().startswith("/"):
         return None
     digits = re.sub(r"\D", "", text)
-    if len(digits) < 10:
+    if not (10 <= len(digits) <= 11):
         return None
     return text.strip()
+
+
+def service_line(service_id: int) -> str:
+    """Строка с выбранной услугой для заголовков шагов."""
+    s = SERVICES[service_id]
+    return f"💼 Услуга: {s['name']} — {s['price']} ₽"
 
 
 def booking_summary_text(data: dict) -> str:
@@ -315,7 +341,7 @@ async def my_bookings_text(user_id: int) -> str:
             f"• №{r['id']} — {r['service_name']}, "
             f"{human_date(r['date'])} в {r['time']}"
         )
-    lines.append("\nОтменить последнюю запись: /cancel")
+    lines.append("\nОтменить любую из них: кнопка «❌ Отменить запись» или /cancel")
     return "\n".join(lines)
 
 
@@ -349,14 +375,15 @@ def services_kb() -> InlineKeyboardMarkup:
 
 
 def dates_kb() -> InlineKeyboardMarkup:
-    """Календарь на DAYS_AHEAD дней вперёд."""
+    """Календарь на DAYS_AHEAD дней вперёд + возврат к услугам."""
     buttons = [
         [InlineKeyboardButton(text=human_date(d), callback_data=f"date:{d}")]
         for d in valid_dates()
     ]
-    buttons.append(
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav:main")]
-    )
+    buttons.append([
+        InlineKeyboardButton(text="⬅️ К выбору услуги", callback_data="nav:to_service"),
+        InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:main"),
+    ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -373,37 +400,59 @@ def times_kb(booked: set, date_iso: str) -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
-    rows.append(
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav:main")]
-    )
+    rows.append([
+        InlineKeyboardButton(text="⬅️ К выбору даты", callback_data="nav:to_date"),
+        InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:main"),
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def back_only_kb() -> InlineKeyboardMarkup:
-    """Только кнопка возврата в главное меню."""
+def name_kb() -> InlineKeyboardMarkup:
+    """Клавиатура шага ввода имени."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav:main")],
+        [
+            InlineKeyboardButton(text="⬅️ К выбору времени", callback_data="nav:to_time"),
+            InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:main"),
+        ],
+    ])
+
+
+def phone_kb() -> InlineKeyboardMarkup:
+    """Клавиатура шага ввода телефона."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⬅️ Исправить имя", callback_data="nav:to_name"),
+            InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:main"),
+        ],
     ])
 
 
 def confirm_kb() -> InlineKeyboardMarkup:
-    """Подтверждение записи."""
+    """Подтверждение записи с возможностью вернуться к телефону."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm:yes"),
             InlineKeyboardButton(text="❌ Отменить", callback_data="confirm:no"),
         ],
+        [
+            InlineKeyboardButton(text="⬅️ Исправить телефон", callback_data="nav:to_phone"),
+        ],
     ])
 
 
-def cancel_kb() -> InlineKeyboardMarkup:
-    """Подтверждение отмены последней записи."""
-    return InlineKeyboardMarkup(inline_keyboard=[
+def cancel_list_kb(rows: list) -> InlineKeyboardMarkup:
+    """Список активных записей кнопками для отмены конкретной."""
+    buttons = [
         [InlineKeyboardButton(
-            text="❌ Отменить последнюю запись", callback_data="cancel:last"
-        )],
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="nav:main")],
-    ])
+            text=f"❌ №{r['id']} · {r['service_name']}, {human_date(r['date'])} {r['time']}",
+            callback_data=f"cancel:{r['id']}",
+        )]
+        for r in rows
+    ]
+    buttons.append(
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="nav:main")]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 # ============================================================
@@ -422,11 +471,13 @@ HELP_TEXT = (
     "1. Нажмите «📅 Записаться».\n"
     "2. Выберите услугу, дату и свободное время.\n"
     "3. Введите имя и телефон.\n"
-    "4. Подтвердите запись.\n\n"
+    "4. Подтвердите запись.\n"
+    "Слот занят под конкретную услугу: разные услуги могут идти "
+    "в одно время, одна услуга — нет.\n\n"
     "<b>Команды:</b>\n"
     "/start — главное меню\n"
     "/my_bookings — мои активные записи\n"
-    "/cancel — отменить последнюю запись\n"
+    "/cancel — отменить любую свою запись\n"
     "/help — эта справка"
 )
 
@@ -484,27 +535,18 @@ async def cmd_my_bookings(message: Message, state: FSMContext) -> None:
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext) -> None:
-    """Отмена последней активной записи пользователя."""
+    """Показывает список активных записей для отмены конкретной."""
     await state.clear()
-    row = await cancel_last_active_booking(message.from_user.id)
-    if row is None:
+    rows = await get_user_active_bookings(message.from_user.id)
+    if not rows:
         await message.answer(
             "У вас нет активных записей — отменять нечего.",
             reply_markup=main_menu_kb(),
         )
         return
     await message.answer(
-        f"❌ Запись отменена: {row['service_name']}, "
-        f"{human_date(row['date'])} в {row['time']}.",
-        reply_markup=main_menu_kb(),
-    )
-    await notify_admin(
-        "<b>⚠️ Клиент отменил запись</b>\n\n"
-        f"💼 Услуга: {row['service_name']}\n"
-        f"📅 Дата: {human_date(row['date'])}\n"
-        f"⏰ Время: {row['time']}\n"
-        f"👤 Клиент: {html.escape(row['name'])}\n"
-        f"📞 Телефон: {html.escape(row['phone'])}"
+        "Какую запись отменить? Нажмите на неё:",
+        reply_markup=cancel_list_kb(rows),
     )
 
 
@@ -533,7 +575,7 @@ async def cmd_today(message: Message) -> None:
 
 
 # ============================================================
-# 8. ХЕНДЛЕРЫ НАВИГАЦИИ (ГЛАВНОЕ МЕНЮ)
+# 8. ХЕНДЛЕРЫ НАВИГАЦИИ (ГЛАВНОЕ МЕНЮ И КНОПКИ «НАЗАД»)
 # ============================================================
 
 @dp.callback_query(F.data == "nav:main")
@@ -570,7 +612,7 @@ async def cb_help(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "nav:cancel")
 async def cb_cancel_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    """Показывает последнюю активную запись и предлагает её отменить."""
+    """Список активных записей для отмены конкретной."""
     await state.clear()
     rows = await get_user_active_bookings(callback.from_user.id)
     if not rows:
@@ -580,14 +622,79 @@ async def cb_cancel_menu(callback: CallbackQuery, state: FSMContext) -> None:
             main_menu_kb(),
         )
     else:
-        last = max(rows, key=lambda r: r["id"])  # последняя по времени создания
         await safe_edit(
             callback,
-            "Отменить последнюю запись?\n\n"
-            f"💼 {last['service_name']}\n"
-            f"📅 {human_date(last['date'])} в {last['time']}",
-            cancel_kb(),
+            "Какую запись отменить? Нажмите на неё:",
+            cancel_list_kb(rows),
         )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "nav:to_service")
+async def cb_to_service(callback: CallbackQuery, state: FSMContext) -> None:
+    """Шаг назад: к выбору услуги."""
+    await state.set_state(BookingForm.service)
+    await safe_edit(callback, "Выберите услугу:", services_kb())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "nav:to_date")
+async def cb_to_date(callback: CallbackQuery, state: FSMContext) -> None:
+    """Шаг назад: к выбору даты (услуга уже выбрана)."""
+    data = await state.get_data()
+    service_id = data.get("service_id")
+    if service_id not in SERVICES:
+        await callback.answer("Сначала выберите услугу: /start", show_alert=True)
+        return
+    await state.set_state(BookingForm.date)
+    await safe_edit(
+        callback,
+        f"{service_line(service_id)}\nВыберите дату:",
+        dates_kb(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "nav:to_time")
+async def cb_to_time(callback: CallbackQuery, state: FSMContext) -> None:
+    """Шаг назад: к выбору времени (услуга и дата уже выбраны)."""
+    data = await state.get_data()
+    service_id, date_iso = data.get("service_id"), data.get("date")
+    if service_id not in SERVICES or not date_iso:
+        await callback.answer("Начните запись заново: /start", show_alert=True)
+        return
+    booked = await get_booked_times(date_iso, service_id)
+    await state.set_state(BookingForm.time)
+    await safe_edit(
+        callback,
+        f"{service_line(service_id)}\n📅 Дата: {human_date(date_iso)}\n"
+        "Выберите свободное время:",
+        times_kb(booked, date_iso),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "nav:to_name")
+async def cb_to_name(callback: CallbackQuery, state: FSMContext) -> None:
+    """Шаг назад: исправить имя."""
+    await state.set_state(BookingForm.name)
+    await safe_edit(
+        callback,
+        "Как вас зовут? Введите имя (например: Анна):",
+        name_kb(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "nav:to_phone")
+async def cb_to_phone(callback: CallbackQuery, state: FSMContext) -> None:
+    """Шаг назад: исправить телефон."""
+    await state.set_state(BookingForm.phone)
+    await safe_edit(
+        callback,
+        "Теперь введите номер телефона (например: +7 999 123-45-67):",
+        phone_kb(),
+    )
     await callback.answer()
 
 
@@ -607,32 +714,43 @@ async def cb_service(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await state.update_data(service_id=service_id)
     await state.set_state(BookingForm.date)
-    await safe_edit(callback, "Выберите дату:", dates_kb())
+    await safe_edit(
+        callback,
+        f"{service_line(service_id)}\nВыберите дату:",
+        dates_kb(),
+    )
     await callback.answer()
 
 
 @dp.callback_query(StateFilter(BookingForm.date), F.data.startswith("date:"))
 async def cb_date(callback: CallbackQuery, state: FSMContext) -> None:
-    """Шаг 2: выбрана дата → показываем свободное время."""
+    """Шаг 2: выбрана дата → показываем свободное время для выбранной услуги."""
     date_iso = callback.data.split(":", 1)[1]
     if date_iso not in valid_dates():
         await callback.answer(
             "Эта дата недоступна. Выберите другую.", show_alert=True
         )
         return
-    booked = await get_booked_times(date_iso)
+    data = await state.get_data()
+    service_id = data.get("service_id")
+    if service_id not in SERVICES:
+        await callback.answer("Начните запись заново: /start", show_alert=True)
+        return
+    booked = await get_booked_times(date_iso, service_id)
     free = [t for t in TIME_SLOTS
             if t not in booked and not is_past_slot(date_iso, t)]
     if not free:
         await callback.answer(
-            "На эту дату всё занято. Выберите другую.", show_alert=True
+            "На эту дату всё занято для выбранной услуги. "
+            "Выберите другую дату.", show_alert=True,
         )
         return
     await state.update_data(date=date_iso)
     await state.set_state(BookingForm.time)
     await safe_edit(
         callback,
-        f"Дата: {human_date(date_iso)}\nВыберите свободное время:",
+        f"{service_line(service_id)}\n📅 Дата: {human_date(date_iso)}\n"
+        "Выберите свободное время:",
         times_kb(booked, date_iso),
     )
     await callback.answer()
@@ -640,9 +758,10 @@ async def cb_date(callback: CallbackQuery, state: FSMContext) -> None:
 
 @dp.callback_query(F.data == "time:busy")
 async def cb_time_busy(callback: CallbackQuery) -> None:
-    """Нажатие на занятый/прошедший слот."""
+    """Нажатие на занятый или прошедший слот."""
     await callback.answer(
-        "Это время уже занято. Выберите другое.", show_alert=True
+        "Это время уже занято для выбранной услуги. Выберите другое.",
+        show_alert=True,
     )
 
 
@@ -653,23 +772,26 @@ async def cb_time(callback: CallbackQuery, state: FSMContext) -> None:
     """Шаг 3: выбрано время → просим имя."""
     time_str = callback.data.split(":", 1)[1]
     data = await state.get_data()
-    date_iso = data.get("date")
-    if time_str not in TIME_SLOTS or not date_iso:
+    date_iso, service_id = data.get("date"), data.get("service_id")
+    if time_str not in TIME_SLOTS or not date_iso or service_id not in SERVICES:
         await callback.answer(
             "Слот недоступен. Начните запись заново: /start", show_alert=True
         )
         return
-    # Повторная проверка: слот могли занять, пока клиент выбирал.
-    if is_past_slot(date_iso, time_str) or await is_slot_taken(date_iso, time_str):
-        booked = await get_booked_times(date_iso)
+    # Повторная проверка: слот под эту услугу могли занять, пока клиент выбирал.
+    if is_past_slot(date_iso, time_str) or await is_slot_taken(
+        date_iso, time_str, service_id
+    ):
+        booked = await get_booked_times(date_iso, service_id)
         await safe_edit(
             callback,
-            f"Дата: {human_date(date_iso)}\nВыберите свободное время:",
+            f"{service_line(service_id)}\n📅 Дата: {human_date(date_iso)}\n"
+            "Выберите свободное время:",
             times_kb(booked, date_iso),
         )
         await callback.answer(
-            "Увы, это время только что заняли. Выберите другое.",
-            show_alert=True,
+            "Увы, это время под выбранную услугу только что заняли. "
+            "Выберите другое.", show_alert=True,
         )
         return
     await state.update_data(time=time_str)
@@ -677,7 +799,7 @@ async def cb_time(callback: CallbackQuery, state: FSMContext) -> None:
     await safe_edit(
         callback,
         "Как вас зовут? Введите имя (например: Анна):",
-        back_only_kb(),
+        name_kb(),
     )
     await callback.answer()
 
@@ -695,7 +817,8 @@ async def msg_name(message: Message, state: FSMContext) -> None:
     await state.update_data(name=name)
     await state.set_state(BookingForm.phone)
     await message.answer(
-        "Теперь введите номер телефона (например: +7 999 123-45-67):"
+        "Теперь введите номер телефона (например: +7 999 123-45-67):",
+        reply_markup=phone_kb(),
     )
 
 
@@ -707,7 +830,7 @@ async def msg_phone(message: Message, state: FSMContext) -> None:
         await message.answer(
             "Не могу распознать номер.\n"
             "Подойдут форматы: +7 999 123-45-67, 89991234567, 9991234567.\n"
-            "Нужно минимум 10 цифр."
+            "Нужно от 10 до 11 цифр, не больше."
         )
         return
     await state.update_data(phone=phone)
@@ -721,12 +844,12 @@ async def cb_confirm_yes(callback: CallbackQuery, state: FSMContext) -> None:
     """Шаг 6: запись подтверждена → сохраняем, уведомляем админа."""
     data = await state.get_data()
     service = SERVICES[data["service_id"]]
-    # Финальная проверка слота перед записью в базу.
-    if await is_slot_taken(data["date"], data["time"]):
+    # Финальная проверка слота под услугу перед записью в базу.
+    if await is_slot_taken(data["date"], data["time"], data["service_id"]):
         await state.clear()
         await safe_edit(
             callback,
-            "К сожалению, это время только что заняли.\n"
+            "К сожалению, это время под выбранную услугу только что заняли.\n"
             "Нажмите «📅 Записаться», чтобы выбрать другое.",
             main_menu_kb(),
         )
@@ -775,33 +898,40 @@ async def cb_confirm_no(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-@dp.callback_query(F.data == "cancel:last")
-async def cb_cancel_last(callback: CallbackQuery, state: FSMContext) -> None:
-    """Отмена последней активной записи из меню."""
+@dp.callback_query(F.data.startswith("cancel:"))
+async def cb_cancel_one(callback: CallbackQuery, state: FSMContext) -> None:
+    """Отмена конкретной записи из списка."""
     await state.clear()
-    row = await cancel_last_active_booking(callback.from_user.id)
-    if row is None:
-        await safe_edit(
-            callback,
-            "Активных записей не найдено — возможно, запись уже отменена.",
-            main_menu_kb(),
-        )
-    else:
-        await safe_edit(
-            callback,
-            f"❌ Запись отменена: {row['service_name']}, "
-            f"{human_date(row['date'])} в {row['time']}.",
-            main_menu_kb(),
-        )
-        await notify_admin(
-            "<b>⚠️ Клиент отменил запись</b>\n\n"
-            f"💼 Услуга: {row['service_name']}\n"
-            f"📅 Дата: {human_date(row['date'])}\n"
-            f"⏰ Время: {row['time']}\n"
-            f"👤 Клиент: {html.escape(row['name'])}\n"
-            f"📞 Телефон: {html.escape(row['phone'])}"
-        )
+    try:
+        booking_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("Неизвестная запись.", show_alert=True)
+        return
+    row = await get_booking_by_id(booking_id)
+    if row is None or row["telegram_user_id"] != callback.from_user.id:
+        await callback.answer("Запись не найдена.", show_alert=True)
+        return
+    if row["status"] != "active":
+        await callback.answer("Эта запись уже отменена.", show_alert=True)
+        return
+    await cancel_booking(booking_id)
+    await safe_edit(
+        callback,
+        f"❌ Запись отменена: {row['service_name']}, "
+        f"{human_date(row['date'])} в {row['time']}.\n"
+        "Слот снова свободен для других клиентов.",
+        main_menu_kb(),
+    )
     await callback.answer()
+    await notify_admin(
+        "<b>⚠️ Клиент отменил запись</b>\n\n"
+        f"💼 Услуга: {row['service_name']}\n"
+        f"📅 Дата: {human_date(row['date'])}\n"
+        f"⏰ Время: {row['time']}\n"
+        f"👤 Клиент: {html.escape(row['name'])}\n"
+        f"📞 Телефон: {html.escape(row['phone'])}\n"
+        f"🆔 Запись №{row['id']}"
+    )
 
 
 # ============================================================
