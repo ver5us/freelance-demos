@@ -291,16 +291,20 @@ def validate_name(text: str):
 
 
 def validate_phone(text: str):
-    """Проверяет телефон: от 10 до 11 цифр. Возвращает телефон как введён или None.
+    """Проверяет телефон по правилам РФ. Возвращает телефон как введён или None.
 
-    Допустимы форматы: +7 999 123-45-67, 89991234567, 9991234567.
+    Принимается: 11 цифр, начинающихся с 7 или 8 (+7 999 123-45-67, 89991234567),
+    либо 10 цифр, начинающихся с 9 (короткая мобильная форма).
+    Обрезанные, нулевые и иностранные номера отклоняются.
     """
     if text.strip().startswith("/"):
         return None
     digits = re.sub(r"\D", "", text)
-    if not (10 <= len(digits) <= 11):
-        return None
-    return text.strip()
+    if len(digits) == 11 and digits[0] in ("7", "8"):
+        return text.strip()
+    if len(digits) == 10 and digits[0] == "9":
+        return text.strip()
+    return None
 
 
 def service_line(service_id: int) -> str:
@@ -829,8 +833,8 @@ async def msg_phone(message: Message, state: FSMContext) -> None:
     if phone is None:
         await message.answer(
             "Не могу распознать номер.\n"
-            "Подойдут форматы: +7 999 123-45-67, 89991234567, 9991234567.\n"
-            "Нужно от 10 до 11 цифр, не больше."
+            "Введите номер РФ: 11 цифр, начинающихся с 7 или 8\n"
+            "(+7 999 123-45-67 или 89991234567), либо 10 цифр, начинающихся с 9."
         )
         return
     await state.update_data(phone=phone)
